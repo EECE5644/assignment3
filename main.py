@@ -1,4 +1,3 @@
-# TODO: Fix the data leakage issue in the preprocessing step.
 import numpy as np
 import pandas as pd
 
@@ -18,11 +17,9 @@ data["Fuel Tank Capacity"] = data["Fuel Tank Capacity"].round().astype("Int64")
 
 
 # ==================== Data Preprocessing ====================
-
 # ---------- Remove useless columns
 data.drop(columns=["Location", "Color", "Length", "Width", "Height"], inplace=True)
 # data.info()
-
 
 # ---------- Numerical extraction
 # NOTE: Extract and convert these values to integer numbers.
@@ -32,57 +29,13 @@ for col in todo_cols: data[col] = data[col].str.extract(r"^([\d.]+)")[0].astype(
 # data[todo_cols].info()
 # print(data[todo_cols].head())
 
-
-# ---------- Detect and handle missing values
-missing_cols = data.columns[data.isnull().any()]
-# print(missing_cols)  # ['Engine', 'Max Power', 'Max Torque', 'Drivetrain', 'Seating Capacity', 'Fuel Tank Capacity']
-
-todo_cols = ["Engine", "Max Power", "Max Torque", "Seating Capacity", "Fuel Tank Capacity"]
-
-# NOTE: Fill fallback: Model -> Make -> global median
-for col in todo_cols:
-    data[col] = data[col].fillna(data.groupby("Model")[col].transform("median").round())
-    data[col] = data[col].fillna(data.groupby("Make")[col].transform("median").round())
-    data[col] = data[col].fillna(round(data[col].median()))
-
-def _mode_or_na(s: pd.Series):
-    m = s.mode()
-    return m.iat[0] if not m.empty else pd.NA
-
-# Drivetrain is categorical -> same Model -> Make -> global hierarchy, but mode instead of median
-data["Drivetrain"] = data["Drivetrain"].fillna(data.groupby("Model")["Drivetrain"].transform(_mode_or_na))
-data["Drivetrain"] = data["Drivetrain"].fillna(data.groupby("Make")["Drivetrain"].transform(_mode_or_na))
-data["Drivetrain"] = data["Drivetrain"].fillna(data["Drivetrain"].mode().iat[0])
-
-# data.info()
-# print(data.nunique())
-
 # ---------- Binary encoding
 binary_cols = data.columns[data.nunique() == 2]
 # print(binary_cols)  # Transmission
-data["Transmission"] = data["Transmission"].map({"Manual": 0, "Automatic": 1})
+data["Transmission"] = data["Transmission"].map({"Manual": 0, "Automatic": 1}).astype("Int64")
 
-
-# ---------- Dummy encoding
-todo_cols = data.select_dtypes(include=["string"]).columns
-# print(todo_cols)  # ['Make', 'Model', 'Fuel Type', 'Owner', 'Seller Type', 'Drivetrain']
-
-# TEST: Drop `Model` column.
-data.drop(columns=["Model"], inplace=True)
-
-# CASE: Change the rare categories to "Other" for Make, Fuel Type, Owner, Seller Type, Drivetrain
-def replace_rare_categories(col: pd.Series, threshold: int = 10) -> pd.Series:
-    counts = col.value_counts()
-    rare_categories = counts[counts < threshold].index.tolist()
-    return col.replace(rare_categories, "Other")
-
-
-data["Make"] = replace_rare_categories(data["Make"])
-data["Fuel Type"] = replace_rare_categories(data["Fuel Type"])
-
-# for col in todo_cols: print(data[col].value_counts())
-
-# CASE: Owner has a natural order (fewer owners = more valuable).
+# ---------- Ordinal encoding
+# NOTE: Owner has a natural order (fewer owners = more valuable).
 owner_order = {
     "UnRegistered Car": 0,
     "First": 1,
@@ -91,30 +44,111 @@ owner_order = {
     "Fourth": 4,
     "4 or More": 5,
 }
-data["Owner"] = data["Owner"].map(owner_order)
+data["Owner"] = data["Owner"].map(owner_order).astype("Int64")
 
-data = pd.get_dummies(data, drop_first=True)
-bool_cols = data.select_dtypes(include=["boolean"]).columns
-data[bool_cols] = data[bool_cols].astype("Int64")
-# data.info()
-
-
-# ---------- Segmentation
+# ---------- Segmentation and train/test split
 features = data.drop(columns="Price")
 # NOTE: Log-transform the target variable to reduce skewness and improve model performance.
 target = np.log1p(data["Price"])
-# features.info()
-
-
-# ==================== Model Training ====================
-
-# ---------- Dataset splitting and model initialization
-model = LinearRegression()
 
 X_train, X_test, y_train, y_test = train_test_split(features, target, train_size=0.8, random_state=818)
 
+# ---------- Detect and handle missing values (stats fit on the training split only)
+# print(X_train.columns[X_train.isnull().any()])  # ['Engine', 'Max Power', 'Max Torque', 'Drivetrain', 'Seating Capacity', 'Fuel Tank Capacity']
 
-# ---------- Model training
+todo_cols = ["Engine", "Max Power", "Max Torque", "Seating Capacity", "Fuel Tank Capacity"]
+
+# NOTE: Fill fallback: Model -> Make -> global median, all computed from X_train only.
+def fit_median_fill_stats(data: pd.DataFrame, cols: list) -> dict:
+    return {
+        col: {
+            "by_model": data.groupby("Model")[col].median().round(),
+            "by_make": data.groupby("Make")[col].median().round(),
+            "global": round(data[col].median()),
+        }
+        for col in cols
+    }
+
+
+def apply_median_fill(data: pd.DataFrame, stats: dict) -> pd.DataFrame:
+    for col, s in stats.items():
+        data[col] = data[col].fillna(data["Model"].map(s["by_model"]))
+        data[col] = data[col].fillna(data["Make"].map(s["by_make"]))
+        data[col] = data[col].fillna(s["global"])
+    return data
+
+
+median_fill_stats = fit_median_fill_stats(X_train, todo_cols)
+X_train = apply_median_fill(X_train, median_fill_stats)
+X_test = apply_median_fill(X_test, median_fill_stats)
+
+
+def mode_or_na(s: pd.Series):
+    m = s.mode()
+    return m.iat[0] if not m.empty else pd.NA
+
+
+# Drivetrain is categorical -> same Model -> Make -> global hierarchy, but mode instead of median.
+def fit_drivetrain_fill_stats(train: pd.DataFrame) -> dict:
+    return {
+        "by_model": train.groupby("Model")["Drivetrain"].agg(mode_or_na),
+        "by_make": train.groupby("Make")["Drivetrain"].agg(mode_or_na),
+        "global": train["Drivetrain"].mode().iat[0],
+    }
+
+
+def apply_drivetrain_fill(data: pd.DataFrame, stats: dict) -> pd.DataFrame:
+    data = data.copy()
+    data["Drivetrain"] = data["Drivetrain"].fillna(data["Model"].map(stats["by_model"]))
+    data["Drivetrain"] = data["Drivetrain"].fillna(data["Make"].map(stats["by_make"]))
+    data["Drivetrain"] = data["Drivetrain"].fillna(stats["global"])
+    return data
+
+
+drivetrain_fill_stats = fit_drivetrain_fill_stats(X_train)
+X_train = apply_drivetrain_fill(X_train, drivetrain_fill_stats)
+X_test = apply_drivetrain_fill(X_test, drivetrain_fill_stats)
+
+# X_train.info()
+# print(X_train.nunique())
+
+# TEST: Drop `Model` column.
+X_train.drop(columns=["Model"], inplace=True)
+X_test.drop(columns=["Model"], inplace=True)
+
+# ---------- Replace rare categories
+# NOTE: Change the rare categories to "Other" for Make and Fuel Type.
+def fit_rare_categories(col: pd.Series, threshold: int = 10) -> list:
+    counts = col.value_counts()
+    return counts[counts < threshold].index.tolist()
+
+
+def apply_rare_categories(col: pd.Series, rare_categories: list) -> pd.Series:
+    return col.replace(rare_categories, "Other")
+
+
+for col in ["Make", "Fuel Type"]:
+    rare_categories = fit_rare_categories(X_train[col])
+    X_train[col] = apply_rare_categories(X_train[col], rare_categories)
+    X_test[col] = apply_rare_categories(X_test[col], rare_categories)
+
+# for col in ["Make", "Fuel Type", "Seller Type", "Drivetrain"]: print(X_train[col].value_counts())
+
+# ---------- Dummy encoding
+categorical_cols = X_train.select_dtypes(include=["string"]).columns.tolist()
+# print(categorical_cols)  # ['Make', 'Fuel Type', 'Seller Type', 'Drivetrain']
+
+X_train = pd.get_dummies(X_train, columns=categorical_cols, drop_first=True)
+X_test = pd.get_dummies(X_test, columns=categorical_cols, drop_first=True).reindex(columns=X_train.columns, fill_value=False)
+
+bool_cols = X_train.select_dtypes(include=["bool"]).columns
+X_train[bool_cols] = X_train[bool_cols].astype("Int64")
+X_test[bool_cols] = X_test[bool_cols].astype("Int64")
+# X_train.info()
+
+
+# ==================== Model Training ====================
+model = LinearRegression()
 model.fit(X_train, y_train)
 
 
@@ -128,6 +162,7 @@ r2 = r2_score(y_test_actual, y_test_pred)
 mae = mean_absolute_error(y_test_actual, y_test_pred)
 mse = mean_squared_error(y_test_actual, y_test_pred)
 rmse = np.sqrt(mse)
+
 print(f"Mean Absolute Error: {mae:.2f}")
 print(f"Root Mean Squared Error: {rmse:.2f}")
 print(f"R-squared: {r2:.2f}")
